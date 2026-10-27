@@ -1,8 +1,9 @@
+
 import mongoose from "mongoose";
 
 const orderSchema = new mongoose.Schema(
   {
-    // Kis customer ne order place kiya
+    // Customer who placed the order
     customer: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -10,7 +11,7 @@ const orderSchema = new mongoose.Schema(
       index: true,
     },
 
-    // Order ke andar products
+    // Products included in the order
     items: [
       {
         product: {
@@ -19,7 +20,6 @@ const orderSchema = new mongoose.Schema(
           required: true,
         },
 
-        // Seller/client ka ID
         seller: {
           type: mongoose.Schema.Types.ObjectId,
           ref: "User",
@@ -50,14 +50,14 @@ const orderSchema = new mongoose.Schema(
       },
     ],
 
-    // Order ka total amount
+    // Order total
     totalAmount: {
       type: Number,
       required: true,
       min: 0,
     },
 
-    // Delivery details
+    // Shipping details
     shippingAddress: {
       fullName: {
         type: String,
@@ -96,13 +96,14 @@ const orderSchema = new mongoose.Schema(
       },
     },
 
-    // Abhi Cash on Delivery support karenge
+    // Payment method
     paymentMethod: {
       type: String,
       enum: ["COD", "RAZORPAY"],
       default: "COD",
     },
 
+    // Payment status
     paymentStatus: {
       type: String,
       enum: ["pending", "paid", "failed", "refunded"],
@@ -112,14 +113,71 @@ const orderSchema = new mongoose.Schema(
     // Overall order status
     status: {
       type: String,
-      enum: ["pending", "confirmed", "shipped", "delivered", "cancelled"],
+      enum: [
+        "pending",
+        "confirmed",
+        "shipped",
+        "delivered",
+        "cancelled",
+      ],
       default: "pending",
       index: true,
     },
+
+    // Inventory fulfillment tracking
+    fulfillmentStatus: {
+      type: String,
+      enum: ["pending", "fulfilled", "failed"],
+      default: "pending",
+      index: true,
+    },
+
+    stockDeducted: {
+      type: Boolean,
+      default: false,
+    },
+
+    // Payment reconciliation tracking
+    reconciliationStatus: {
+      type: String,
+      enum: [
+        "not_required",
+        "required",
+        "in_progress",
+        "resolved",
+      ],
+      default: "not_required",
+      index: true,
+    },
+
+    reconciliationReason: {
+      type: String,
+      default: "",
+    },
+
+    // Refund tracking
+    refundStatus: {
+      type: String,
+      enum: [
+        "not_required",
+        "pending",
+        "processed",
+        "failed",
+      ],
+      default: "not_required",
+    },
+
+    razorpayRefundId: {
+      type: String,
+      default: null,
+    },
+
+    // Razorpay references
     razorpayOrderId: {
       type: String,
       default: null,
     },
+
     razorpayPaymentId: {
       type: String,
       default: null,
@@ -128,6 +186,8 @@ const orderSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-const Order = mongoose.models.Order || mongoose.model("Order", orderSchema);
+const Order =
+  mongoose.models.Order ||
+  mongoose.model("Order", orderSchema);
 
 export default Order;

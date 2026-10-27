@@ -1,13 +1,181 @@
 import Razorpay from "razorpay";
 import crypto from "crypto";
 import mongoose from "mongoose";
+
 import Cart from "../models/cart.js";
 import Order from "../models/order.js";
+import Product from "../models/product.js";
+import PaymentWebhookEvent from "../models/paymentWebhookEvent.js";
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+const finalizePaidOrder = async ({ orderId, paymentId, session }) => {
+  const order = await Order.findById(orderId).session(session);
+
+  if (!order) {
+    throw new Error("Order not found");
+  }
+
+  // Never deduct stock twice for an already-paid order.
+  if (order.paymentStatus === "paid") {
+    return { alreadyProcessed: true, order };
+  }
+
+  if (order.paymentStatus !== "pending") {
+    throw new Error("Order is not awaiting payment");
+  }
+
+  // Deduct stock atomically inside the transaction.
+  for (const item of order.items) {
+    const updatedProduct = await Product.findOneAndUpdate(
+      {
+        _id: item.product,
+        status: "active",
+        inStock: true,
+        stockCount: { $gte: item.quantity },
+      },
+      {
+        $inc: { stockCount: -item.quantity },
+      },
+      {
+        new: true,
+        session,
+      },
+    );
+
+    if (!updatedProduct) {
+      const error = new Error(
+        `Insufficient stock or unavailable product: ${item.name}`,
+      );
+
+      error.code = "STOCK_FULFILLMENT_FAILED";
+      throw error;
+    }
+
+    updatedProduct.inStock = updatedProduct.stockCount > 0;
+    await updatedProduct.save({ session });
+  }
+
+  // Remove only the purchased quantity from the cart.
+  for (const item of order.items) {
+    await Cart.updateOne(
+      {
+        user: order.customer,
+        items: {
+          $elemMatch: {
+            product: item.product,
+            quantity: { $gte: item.quantity },
+          },
+        },
+      },
+      {
+        $inc: {
+          "items.$.quantity": -item.quantity,
+        },
+      },
+      { session },
+    );
+
+    // Remove the cart item if its remaining quantity is zero.
+    await Cart.updateOne(
+      { user: order.customer },
+      {
+        $pull: {
+          items: {
+            product: item.product,
+            quantity: { $lte: 0 },
+          },
+        },
+      },
+      { session },
+    );
+  }
+
+  order.paymentStatus = "paid";
+  order.razorpayPaymentId = paymentId;
+  order.fulfillmentStatus = "fulfilled";
+  order.stockDeducted = true;
+  order.reconciliationStatus = "not_required";
+  order.reconciliationReason = "";
+  order.refundStatus = "not_required";
+
+  await order.save({ session });
+
+  return { alreadyProcessed: false, order };
+};
+
+const markPaymentForReconciliation = async (
+  razorpayOrderId,
+  reason,
+  paymentId,
+) => {
+  return Order.findOneAndUpdate(
+    {
+      razorpayOrderId,
+      paymentMethod: "RAZORPAY",
+      paymentStatus: "pending",
+      stockDeducted: { $ne: true },
+    },
+    {
+      $set: {
+        paymentStatus: "paid",
+        razorpayPaymentId: paymentId,
+        fulfillmentStatus: "failed",
+        stockDeducted: false,
+        reconciliationStatus: "required",
+        reconciliationReason: reason,
+        refundStatus: "pending",
+      },
+    },
+    { new: true },
+  );
+};
+
+
+const initiateRefund = async (orderId) => {
+  const order = await Order.findById(orderId);
+
+  if (!order) {
+    throw new Error("Order not found");
+  }
+
+ if (
+  order.paymentStatus !== "paid" ||
+  order.fulfillmentStatus !== "failed" ||
+  order.reconciliationStatus !== "required" ||
+  order.refundStatus !== "pending" ||
+  order.razorpayRefundId
+) {
+  throw new Error("Order is not eligible for a new refund");
+}
+
+  if (!order.razorpayPaymentId) {
+    throw new Error("Razorpay payment ID is missing");
+  }
+
+  const refund = await razorpay.payments.refund(
+    order.razorpayPaymentId,
+    {
+      amount: order.totalAmount * 100,
+      notes: {
+        orderId: order._id.toString(),
+        reason: "Stock fulfillment failed",
+      },
+    },
+  );
+
+  order.refundStatus = "pending";
+  order.razorpayRefundId = refund.id;
+  order.reconciliationStatus = "in_progress";
+
+  await order.save();
+
+  return refund;
+};
+
 
 export const createPaymentOrder = async (req, res) => {
   try {
@@ -36,7 +204,7 @@ export const createPaymentOrder = async (req, res) => {
       requiredFields.some(
         (field) =>
           typeof shippingAddress[field] !== "string" ||
-          !shippingAddress[field].trim()
+          !shippingAddress[field].trim(),
       )
     ) {
       return res.status(400).json({
@@ -46,9 +214,7 @@ export const createPaymentOrder = async (req, res) => {
     }
 
     // Get the logged-in customer's cart
-    const cart = await Cart.findOne({ user: userId }).populate(
-      "items.product"
-    );
+    const cart = await Cart.findOne({ user: userId }).populate("items.product");
 
     if (!cart || cart.items.length === 0) {
       return res.status(400).json({
@@ -134,27 +300,20 @@ export const createPaymentOrder = async (req, res) => {
   }
 };
 
-
 export const verifyPayment = async (req, res) => {
-  try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-    } = req.body;
+  let session;
 
-    if (
-      !razorpay_order_id ||
-      !razorpay_payment_id ||
-      !razorpay_signature
-    ) {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
+      req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
         success: false,
         message: "Payment verification details are required",
       });
     }
 
-    // Find the order created by our backend
     const order = await Order.findOne({
       razorpayOrderId: razorpay_order_id,
       customer: req.user.id,
@@ -168,7 +327,7 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Do not verify or process the same order twice
+    // Idempotent response: never deduct stock twice.
     if (order.paymentStatus === "paid") {
       return res.status(200).json({
         success: true,
@@ -176,6 +335,7 @@ export const verifyPayment = async (req, res) => {
         data: {
           orderId: order._id,
           paymentStatus: order.paymentStatus,
+          status: order.status,
         },
       });
     }
@@ -187,7 +347,6 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Generate the expected Razorpay signature
     const expectedSignature = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -196,21 +355,17 @@ export const verifyPayment = async (req, res) => {
     const received = Buffer.from(razorpay_signature, "hex");
     const expected = Buffer.from(expectedSignature, "hex");
 
-    const signatureIsValid =
-      received.length === expected.length &&
-      crypto.timingSafeEqual(received, expected);
-
-    if (!signatureIsValid) {
+    if (
+      received.length !== expected.length ||
+      !crypto.timingSafeEqual(received, expected)
+    ) {
       return res.status(400).json({
         success: false,
         message: "Invalid payment signature",
       });
     }
 
-    // Fetch payment details directly from Razorpay
-    const payment = await razorpay.payments.fetch(
-      razorpay_payment_id
-    );
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
 
     if (
       payment.order_id !== razorpay_order_id ||
@@ -220,50 +375,92 @@ export const verifyPayment = async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message: "Payment is not captured or payment details do not match",
+        message: "Payment is not captured or details do not match",
       });
     }
 
-    // Record verified payment. Stock finalization and cart clearing
-    // must be handled atomically before using this flow in production.
-    order.paymentStatus = "paid";
-    order.razorpayPaymentId = razorpay_payment_id;
-    await order.save();
+    session = await mongoose.startSession();
+
+    let result;
+
+    await session.withTransaction(async () => {
+      result = await finalizePaidOrder({
+        orderId: order._id,
+        paymentId: razorpay_payment_id,
+        session,
+      });
+    });
 
     return res.status(200).json({
       success: true,
-      message: "Payment verified successfully",
+      message: result.alreadyProcessed
+        ? "Payment has already been finalized"
+        : "Payment verified and order finalized successfully",
       data: {
-        orderId: order._id,
-        razorpayPaymentId: razorpay_payment_id,
-        paymentStatus: order.paymentStatus,
-        status: order.status,
+        orderId: result.order._id,
+        paymentStatus: result.order.paymentStatus,
+        status: result.order.status,
       },
     });
   } catch (error) {
     console.error("Verify payment error:", error);
 
+    if (error.code === "STOCK_FULFILLMENT_FAILED") {
+      try {
+        const { razorpay_order_id, razorpay_payment_id } = req.body;
+
+        const reconciledOrder = await markPaymentForReconciliation(
+          razorpay_order_id,
+          error.message,
+          razorpay_payment_id,
+        );
+
+        if (reconciledOrder) {
+          return res.status(200).json({
+            success: true,
+            message:
+              "Payment received, but stock fulfillment failed. Refund reconciliation is required.",
+            data: {
+              orderId: reconciledOrder._id,
+              paymentStatus: reconciledOrder.paymentStatus,
+              fulfillmentStatus: reconciledOrder.fulfillmentStatus,
+              reconciliationStatus: reconciledOrder.reconciliationStatus,
+            },
+          });
+        }
+      } catch (reconciliationError) {
+        console.error("Reconciliation error:", reconciliationError);
+      }
+    }
+
     return res.status(500).json({
       success: false,
-      message: "Failed to verify payment",
+      message: "Payment verification or finalization failed",
     });
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
   }
 };
 
-
 export const handleRazorpayWebhook = async (req, res) => {
+  const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  const signature = req.headers["x-razorpay-signature"];
+  const eventId = req.headers["x-razorpay-event-id"];
+
+  if (!webhookSecret || !Buffer.isBuffer(req.body) || !signature || !eventId) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid webhook request",
+    });
+  }
+
+  let session;
+  let capturedPayment = null;
+
   try {
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-    const signature = req.headers["x-razorpay-signature"];
-
-    if (!webhookSecret || !Buffer.isBuffer(req.body) || !signature) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid webhook request",
-      });
-    }
-
-    // Verify signature against the exact raw request body.
+    // Verify the signature against the exact raw body.
     const expectedSignature = crypto
       .createHmac("sha256", webhookSecret)
       .update(req.body)
@@ -283,51 +480,138 @@ export const handleRazorpayWebhook = async (req, res) => {
     }
 
     const event = JSON.parse(req.body.toString("utf8"));
+
+    // Acknowledge unrelated events without processing them.
+    if (!["payment.captured", "payment.failed"].includes(event.event)) {
+      return res.status(200).json({
+        success: true,
+        received: true,
+        message: "Event ignored",
+      });
+    }
+
     const payment = event.payload?.payment?.entity;
 
-    if (
-      ["payment.captured", "payment.failed"].includes(event.event) &&
-      payment?.order_id
-    ) {
+    if (event.event === "payment.captured") {
+      capturedPayment = payment;
+    }
+
+    if (!payment?.order_id || !payment?.id) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment details missing from event",
+      });
+    }
+
+    session = await mongoose.startSession();
+
+    let alreadyProcessed = false;
+
+    await session.withTransaction(async () => {
+      // Unique eventId prevents duplicate event processing.
+      await PaymentWebhookEvent.create(
+        [
+          {
+            eventId,
+            eventType: event.event,
+            processed: false,
+          },
+        ],
+        { session },
+      );
+
       const order = await Order.findOne({
         razorpayOrderId: payment.order_id,
         paymentMethod: "RAZORPAY",
-      });
+      }).session(session);
 
-      if (order) {
-        // Validate payment details before accepting capture.
-        if (
-          event.event === "payment.captured" &&
-          payment.amount === order.totalAmount * 100 &&
-          payment.currency === "INR" &&
-          payment.status === "captured"
-        ) {
-          if (order.paymentStatus !== "paid") {
-            order.paymentStatus = "paid";
-            order.razorpayPaymentId = payment.id;
-            await order.save();
-          }
-        } else if (
-          event.event === "payment.failed" &&
-          order.paymentStatus === "pending"
-        ) {
-          order.paymentStatus = "failed";
-          order.razorpayPaymentId = payment.id;
-          await order.save();
-        }
+      if (!order) {
+        throw new Error("Order for Razorpay payment not found");
       }
-    }
+
+      if (event.event === "payment.captured") {
+        if (
+          payment.status !== "captured" ||
+          payment.amount !== order.totalAmount * 100 ||
+          payment.currency !== "INR"
+        ) {
+          throw new Error("Captured payment details do not match order");
+        }
+
+        const result = await finalizePaidOrder({
+          orderId: order._id,
+          paymentId: payment.id,
+          session,
+        });
+
+        alreadyProcessed = result.alreadyProcessed;
+      } else if (event.event === "payment.failed") {
+        // Do not finalize inventory or permanently fail the order
+        // based only on an individual failed payment attempt.
+        // Payment status will be reconciled separately.
+      }
+
+      await PaymentWebhookEvent.updateOne(
+        { eventId },
+        {
+          $set: {
+            processed: true,
+            processedAt: new Date(),
+          },
+        },
+        { session },
+      );
+    });
 
     return res.status(200).json({
       success: true,
       received: true,
+      alreadyProcessed,
     });
   } catch (error) {
+    if (error.code === 11000) {
+      return res.status(200).json({
+        success: true,
+        received: true,
+        message: "Duplicate event already received",
+      });
+    }
+
     console.error("Razorpay webhook error:", error);
+
+    if (
+      error.code === "STOCK_FULFILLMENT_FAILED" &&
+      capturedPayment?.order_id &&
+      capturedPayment?.id
+    ) {
+      try {
+        const reconciledOrder = await markPaymentForReconciliation(
+          capturedPayment.order_id,
+          error.message,
+          capturedPayment.id,
+        );
+
+        if (reconciledOrder) {
+          // Return 200 only after reconciliation was recorded.
+          return res.status(200).json({
+            success: true,
+            received: true,
+            message: "Payment captured; fulfillment requires reconciliation",
+            reconciliationStatus: reconciledOrder.reconciliationStatus,
+          });
+        }
+      } catch (reconciliationError) {
+        console.error("Webhook reconciliation error:", reconciliationError);
+      }
+    }
 
     return res.status(500).json({
       success: false,
       message: "Webhook processing failed",
     });
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
   }
 };
